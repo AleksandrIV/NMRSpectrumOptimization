@@ -2,7 +2,6 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import numpy as np
 import torch
-from scipy import integrate
 from collections import OrderedDict
 import os
 import shutil
@@ -38,10 +37,10 @@ def integrate_exp_spectrum(I, Hz):
         #print("d:",d)
         if d > dx:
             stop = i
-            integral = integral + integrate.trapz(I[start:stop], Hz[start:stop])
+            integral = integral + np.trapz(I[start:stop], Hz[start:stop])
             #print(integral)
             start = i + 1
-    integral = integral + integrate.trapz(I[start:i], Hz[start:i])
+    integral = integral + np.trapz(I[start:i], Hz[start:i])
     return integral
 
 
