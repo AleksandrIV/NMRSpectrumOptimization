@@ -1,229 +1,186 @@
 import torch
-
-import sys
-import os
-
-sys.path.append('src')
-
-from utils import load_pth_file, load_pth_model
-
-from model_single import ComplexModel as model_single
-
-from itertools import product
-
-from inputs import integrate_exp_spectrum, ppm_to_hz
-import os.path
-
-import pickle
-from tqdm import tqdm
-
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
+import torch.optim as optim
+from torch import Tensor
 
-import datetime
 import numpy as np
-import pandas as pd
-
-import plotly.graph_objects as go
-from ipywidgets import widgets
-from copy import deepcopy
-from IPython.display import display, Math
+from typing import Dict, List, Tuple, Optional, Any
+import logging
+from pathlib import Path
+from collections import OrderedDict
 
 
-def code_matrix(array,key):
-    if len(array.shape)<2:
-        array=array.reshape(1,-1)
-    init=f'{key}='
-    matrix = ''
-    for row in array:
-        try:
-            for number in row:
-                matrix += f'{number}&'
-        except TypeError:
-            matrix += f'{row}&'
-        matrix = matrix[:-1] + r'\\'
-    return init+r'\begin{bmatrix}'+matrix+r'\end{bmatrix}'
+
+# Настройка логирования
+logger = logging.getLogger(__name__)
 
 
-def print_matrix(array):
+class OptimizationError(Exception):
+    """Кастомное исключение для ошибок оптимизации."""
+    pass
+
+
+def cosine_similarity_loss(x: Tensor, y: Tensor) -> Tensor:
     """
-    Отрисовка массива в виде матрицы
+    Compute cosine similarity loss between two tensors.
+    
+    Args:
+        x: First tensor
+        y: Second tensor
+        
+    Returns:
+        Negative cosine similarity loss
     """
-    matrix = ''
-    for row in array:
-        try:
-            for number in row:
-                matrix += f'{number}&'
-        except TypeError:
-            matrix += f'{row}&'
-        matrix = matrix[:-1] + r'\\'
-    print(r'\begin{bmatrix}'+matrix+r'\end{bmatrix}')
-    display(Math(r'\begin{bmatrix}'+matrix+r'\end{bmatrix}'))
+    if not isinstance(x, Tensor) or not isinstance(y, Tensor):
+        raise TypeError("Both inputs must be torch.Tensors")
     
+    if x.shape != y.shape:
+        raise ValueError("Input tensors must have the same shape")
     
-def cos_value(x,y):
-    tx=torch.norm(x)
-    ty=torch.norm(y)
-    if tx==0 or ty==0:
-        return tx
+    x_norm = torch.norm(x)
+    y_norm = torch.norm(y)
+    
+    if x_norm == 0 or y_norm == 0:
+        return x_norm
+    
+    cosine_sim = x @ y / (x_norm * y_norm)
+    return -cosine_sim
+
+
+def create_convolution_kernel(width: int, kernel_type: str = "lorenz") -> Tensor:
+    """
+    Create convolution kernel for spectrum smoothing.
+    
+    Args:
+        width: Kernel width parameter
+        kernel_type: Type of kernel ('lorenz' or 'gauss')
+        
+    Returns:
+        Convolution kernel tensor
+    """
+    if width <= 0:
+        raise ValueError("Width must be positive")
+    
+    kernel_range = torch.arange(-4 * width, 4 * width + 1)
+    
+    if kernel_type == "lorenz":
+        kernel = 0.5 / width * ((0.5 * width) ** 2 / ((0.5 * width) ** 2 + kernel_range ** 2))
+    elif kernel_type == "gauss":
+        kernel = 0.1 * torch.exp(-(kernel_range ** 2) / width ** 2)
     else:
-        return -x@y/tx/ty
+        raise ValueError("kernel_type must be 'lorenz' or 'gauss'")
     
-    
-    
-def optimization(model2,target, width=0):
-    """
-    Основная функция, которая оптимизирует начальное приближение метаболитов, переданное в model2, под сигнал target'
-    Модель возвращает модель, метрику до оптимизации m1, метрика после оптимизации m2
-    """ 
-    
-    """
-    Подобный код закрепляет фиксирует параметры системы
-    for m in model2.models:
-        m.r0.requires_grad=False
-        m.w0.requires_grad=False        
-    """
-    
-    loss_fn = nn.MSELoss(reduction='sum')
-    loss_fn2=cos_value
-    loss = 1
-    optimizer = torch.optim.Adam(model2.parameters(), lr=1e-2)
-    #scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,factor=0.9)
-    if width!=0:
-        kernel_lorenz=0.5/width * 1 * ((0.5 * width) ** 2 / ((0.5 * width) ** 2 + torch.arange(-4*width,4*width+1) ** 2)).view(1,1,-1)
-    kernel_gauss=0.1*torch.exp(-(torch.arange(-4*width,4*width+1))**2/width**2).view(1,1,-1)
+    return kernel.view(1, 1, -1)
 
-    t=F.conv1d(target[:,1].clone().view(1,-1),kernel_lorenz,padding=width*4).squeeze() if width>0 else target[:,1]
-    ids_nn=t>0
-    loss_vals = []
-    num_epochs=500
-    # optimizer.param_groups[0]['lr']=1e-2
-    m1=torch.log(1+loss_fn2(model2(target[:,0])[:,1], t))
-    for epoch in range(num_epochs):
-        if loss>-100.995:
-            optimizer.zero_grad()
-            output = model2(target[:,0])
-            loss = torch.log(1+loss_fn2(output[:,1], t[:])) #+torch.log(loss_fn(output[ids_nn,1], t[ids_nn])) 
-#             print('loss', loss.item())
-            loss.backward(retain_graph=True)
 
-            optimizer.step()
-            #scheduler.step(loss)
-            loss_vals.append(loss.item())
-    m2=torch.log(1+loss_fn2(model2(target[:,0])[:,1], t))
-    
-    return model2,m1,m2
-    
-def optimization_reg(model2, target, lambda_reg=0.5, width=0):
+def optimize_model(
+    model: nn.Module,
+    target: Tensor,
+    width: int = 0,
+    learning_rate: float = 1e-2,
+    num_epochs: int = 500,
+    use_regularization: bool = False,
+    lambda_reg: float = 0.5
+) -> Tuple[nn.Module, Tensor, Tensor]:
     """
-    Тот же метод, но с примером регуляризации
+    Optimize model parameters to fit target spectrum.
+    
+    Args:
+        model: Model to optimize
+        target: Target spectrum tensor [frequency, intensity]
+        width: Smoothing kernel width
+        learning_rate: Optimization learning rate
+        num_epochs: Number of training epochs
+        use_regularization: Whether to use regularization
+        lambda_reg: Regularization strength
+        
+    Returns:
+        Tuple of (optimized_model, initial_metric, final_metric)
     """
-    loss_fn = nn.MSELoss(reduction='sum')
-    loss_fn2 = cos_value
+    if not isinstance(model, nn.Module):
+        raise TypeError("model must be a nn.Module")
     
-    optimizer = torch.optim.Adam(model2.parameters(), lr=1e-2)
+    if target.shape[1] != 2:
+        raise ValueError("Target must have shape [n_points, 2]")
     
-    if width != 0:
-        kernel_lorenz = 0.5 / width * 1 * ((0.5 * width) ** 2 / ((0.5 * width) ** 2 + torch.arange(-4*width, 4*width+1) ** 2)).view(1, 1, -1)
-    kernel_gauss = 0.1 * torch.exp(-(torch.arange(-4*width, 4*width+1))**2 / width**2).view(1, 1, -1)
+    # Setup optimization
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    loss_fn = cosine_similarity_loss
     
-    t = (F.conv1d(target[:, 1].clone().view(1, -1), kernel_lorenz, padding=width*4).squeeze()
-         if width > 0 else target[:, 1])
+    # Prepare target spectrum
+    if width > 0:
+        kernel = create_convolution_kernel(width, "lorenz")
+        target_smoothed = F.conv1d(
+            target[:, 1].clone().view(1, 1, -1), 
+            kernel, 
+            padding=width * 4
+        ).squeeze()
+    else:
+        target_smoothed = target[:, 1]
     
-    ids_nn = t > 0
-    loss_vals = []
-    num_epochs = 500
-    m1 = torch.log(1 + loss_fn2(model2(target[:, 0])[:, 1], t))
+    # Calculate initial metric
+    with torch.no_grad():
+        initial_output = model(target[:, 0])
+        initial_metric = torch.log(1 + loss_fn(initial_output[:, 1], target_smoothed))
+    
+    # Training loop
+    loss_history = []
     
     for epoch in range(num_epochs):
         optimizer.zero_grad()
-        output = model2(target[:, 0])
         
-        loss_main = torch.log(1 + loss_fn2(output[:, 1], t))
+        # Forward pass
+        output = model(target[:, 0])
+        main_loss = torch.log(1 + loss_fn(output[:, 1], target_smoothed))
         
-        reg_loss = 0
-        for m in model2.models:
-            """
-            Регуляризуем 01 и 10 элементы матрицы J
-            """
-            reg_loss += (m.J0[0, 1] ** 2) + (m.J0[1, 0] ** 2) 
-        reg_loss = lambda_reg * reg_loss
+        # Add regularization if requested
+        if use_regularization:
+            reg_loss = _compute_regularization_loss(model, lambda_reg)
+            total_loss = main_loss + reg_loss
+        else:
+            total_loss = main_loss
         
-        loss = loss_main + reg_loss
-        loss.backward(retain_graph=True)
+        # Backward pass
+        total_loss.backward(retain_graph=True)
         optimizer.step()
         
-        loss_vals.append(loss.item())
-        # print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item():.4f}, Reg Loss: {reg_loss.item():.4f}")
-    
-    m2 = torch.log(1 + loss_fn2(model2(target[:, 0])[:, 1], t))
-    
-    return model2, m1, m2    
-
-
-def save_results(model2, m1, m2, metabolite):
-    with open(f'{metabolite}.html', encoding='utf-8') as inf:
-        strhtml = inf.read()
-    sspl = strhtml.rsplit('</div>')
-
-    s_ad = f'''
-      <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
-      <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
-      '''
-    for k in model2.state_dict().keys():
-        ki = r'proton\:config' if k == 'proton_config' else k
-        latex_formula = code_matrix(model2.state_dict()[k], ki)
-        s_ad += f'''
-      <div style="font-size: 24px;">
-        \\[ {latex_formula} \\]
-      </div>
-      '''
-    latex_formula = r"metric\:before\:" + f"= {m1}, after = {m2}"
-    s_ad += f'''<div style="font-size: 24px;">
-        \\[ {latex_formula} \\]
-      </div>'''
-
-    s = ''
-    for i in range(len(sspl) - 1):
-        s += sspl[i] + '</div>'
-
-    s += s_ad
-    s += sspl[-1]
-
-    with open(f'{metabolite}.html', "w", encoding='utf-8') as outf:
-        outf.write(s)
+        loss_history.append(total_loss.item())
         
-        
-        
-def prepare_html(model2,m1,m2,target, metabolite):
-    f=go.Figure(layout={'xaxis':{'title':'Hz'}})
-    f.add_trace(go.Scatter(x=target[:,0].numpy(),y=target[:,1].detach().numpy(),name='target'))
-    f.add_trace(go.Scatter(x=target[:,0].numpy(),y=model2(target[:,0])[:,1].detach().numpy(),name='predicted'))
-    # f.show()
-    f.write_html(f'{metabolite}.html')
-    save_results(model2,m1,m2,metabolite)
-    #torch.save(model2.state_dict(),f'data/pth/{metabolite}.pth')
+        if epoch % 100 == 0:
+            logger.debug(f"Epoch {epoch}, Loss: {total_loss.item():.6f}")
     
+    # Calculate final metric
+    with torch.no_grad():
+        final_output = model(target[:, 0])
+        final_metric = torch.log(1 + loss_fn(final_output[:, 1], target_smoothed))
     
+    logger.info(f"Optimization completed: initial={initial_metric.item():.6f}, "
+                f"final={final_metric.item():.6f}")
     
-def optimize_and_save(metabolite):
-    model2 = load_pth_model(f'data/pth/{metabolite}.pth')
-    if model2 is None:
-        return 0,0,0
-    exp_spectrum=pd.read_csv(f'data/csv/{file}').values 
-    ids=np.where(exp_spectrum[:,1]>1e-4)[0][[0,-1]]
-    ids[0]=max(ids[0]-(ids[1]-ids[0])//2,0)
-    ids[1]=min(ids[1]+(ids[1]-ids[0])//2,exp_spectrum.shape[0]-1)
-    exp_spectrum=exp_spectrum[ids[0]:ids[1],:]
-    exp_Hz=ppm_to_hz(exp_spectrum[:,0], model2.models[0].freq.numpy()).view(-1)
-    exp_I=exp_spectrum[:,1]
-    exp_area = integrate_exp_spectrum(exp_I, exp_Hz.view(-1).detach().numpy())
-    exp_I = [i/exp_area for i in exp_I]
-    tens_Hz = torch.FloatTensor(exp_Hz)
-    tens_I = torch.FloatTensor(exp_I)
+    return model, initial_metric, final_metric
 
-    target = torch.stack((tens_Hz, tens_I), -1).detach()
-    model2,m1,m2=optimization(model2,target)
-    prepare_html(model2,m1,m2,target, metabolite)
-    return m1,m2,model2
+
+def _compute_regularization_loss(model: nn.Module, lambda_reg: float) -> Tensor:
+    """
+    Compute regularization loss for model parameters.
+    
+    Args:
+        model: Model to regularize
+        lambda_reg: Regularization strength
+        
+    Returns:
+        Regularization loss
+    """
+    reg_loss = 0.0
+    
+    for module in model.models:
+        if hasattr(module, 'J0') and module.J0 is not None:
+            # Regularize off-diagonal elements of J-coupling matrix
+            j_matrix = module.J0
+            if j_matrix.dim() == 2 and j_matrix.shape[0] >= 2 and j_matrix.shape[1] >= 2:
+                reg_loss += (j_matrix[0, 1] ** 2) + (j_matrix[1, 0] ** 2)
+    
+    return lambda_reg * reg_loss
+
+
