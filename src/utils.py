@@ -68,6 +68,9 @@ class StateDictGenerator:
             
         if param_name not in self.PARAM_NAMES:
             raise ValueError(f"param_name must be one of {self.PARAM_NAMES}")
+
+        if param_name == 'ppm0':
+            self.state_dict[f"{self.MODEL_PREFIX}{model_idx}.{'v0'}"] = value*self.state_dict[f"{self.MODEL_PREFIX}{model_idx}.{'freq'}"]   
             
         self.state_dict[f"{self.MODEL_PREFIX}{model_idx}.{param_name}"] = value
 
